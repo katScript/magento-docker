@@ -1,0 +1,125 @@
+#!/bin/bash
+GIT=""
+BRANCH=""
+DATABASE=""
+ENV_FILE=""
+BASE_URL=""
+
+green=$(tput setaf 2)
+blue=$(tput setaf 4)
+normal=$(tput sgr0)
+
+#URL, GIT, BRANCH ,DATABASE, env.php
+read -p "GIT URL (git src code): " -e -i "git@github.com:katScript/magento-docker.git" GIT
+read -p "GIT Branch: " -e -i "master" BRANCH
+read -p "DATABASE (you can leave it empty to skip the sql import): " -e -i "mysql/m2.sql" DATABASE
+read -p "ENV File: " -e -i "env/env.php" ENV_FILE
+read -p "BASE URL: " -e -i "magento2.test" BASE_URL
+
+if [ -n "$GIT" ] && [ -n "$BRANCH" ] && [ -n "$ENV_FILE" ] && [ -n "$BASE_URL" ]; 
+then
+    echo "${green}Pull the code & switch branch...${normal}"
+    bin/git-pull $GIT $BRANCH
+    echo "Restart containers to mount files..."
+    bin/stop
+    bin/start
+    sleep 3
+    bin/restart
+    sleep 2
+    if [ -z "$DATABASE" ]
+    then
+        echo "${blue}Skip database import...${normal}"
+    else
+        echo "${green}Import database...${normal}"
+        bin/mysql-import $DATABASE
+    fi
+    echo "${green}copy env.php file...${normal}"
+    cp $ENV_FILE src/app/etc/
+    echo "Copying all files from host to container..."
+    rm -rf src/vendor #Clear for step below
+    bin/copytocontainer --all
+
+    bin/clinotty chmod u+x bin/magento
+    echo "Checking composer..."
+    if hash composer 2>/dev/null; then
+        PUBLIC_KEY="$(composer config -gl | grep '\[http-basic.repo.magento.com.username\]' | cut -c40-)"
+        PRIVATE_KEY="$(composer config -gl | grep '\[http-basic.repo.magento.com.password\]' | cut -c40-)"
+    fi
+
+    if [ -z "$PUBLIC_KEY" ] || [ -z "$PRIVATE_KEY" ]; then
+        exec < /dev/tty
+        echo
+        echo
+        echo "    Authentication required (repo.magento.com, public_key and private_key):"
+        read -p "        Username: " -e -i "21669500c00158b6a6ef9e36b3683b05" PUBLIC_KEY
+        read -p "        Password: " -e -i "2b5fc6686d6466ddae957f3218e4ddec" PRIVATE_KEY
+        echo
+        if [ -n "$PUBLIC_KEY" ] && [ -n "$PRIVATE_KEY" ] && hash composer 2>/dev/null; then
+            read -p "    Add authentication information to host composer config? y/n: " ADD_AUTH
+            echo
+            if [[ $ADD_AUTH =~ ^[Yy]$ ]]; then
+                composer global config http-basic.repo.magento.com $PUBLIC_KEY $PRIVATE_KEY
+            fi
+            ADD_AUTH=''
+        fi
+        exec <&-
+    fi
+
+    if [ -n "$PUBLIC_KEY" ] && [ -n "$PRIVATE_KEY" ]; then
+        bin/clinotty composer config http-basic.repo.magento.com $PUBLIC_KEY $PRIVATE_KEY
+        PUBLIC_KEY=''
+        PRIVATE_KEY=''
+    fi
+
+    echo "Forcing reinstall of composer deps to ensure perms & reqs..."
+    bin/clinotty composer global require hirak/prestissimo
+    bin/clinotty composer install
+
+    bin/clinotty bin/magento cache:flush
+    bin/clinotty bin/magento deploy:mode:set developer
+    bin/clinotty bin/magento setup:upgrade
+    bin/clinotty bin/magento indexer:reindex
+
+    echo "Config Base url..."
+    bin/clinotty bin/magento config:set web/unsecure/base_url "https://$BASE_URL/"
+    bin/clinotty bin/magento config:set web/secure/base_url "https://$BASE_URL/"
+
+    echo "Forcing deploy of static content to speed up initial requests..."
+    bin/clinotty bin/magento setup:static-content:deploy -f
+
+    echo "Enabling Redis for cache..."
+    bin/clinotty bin/magento setup:config:set --no-interaction --cache-backend=redis --cache-backend-redis-server=redis --cache-backend-redis-db=0
+
+    echo "Enabling Redis for Full Page Cache..."
+    bin/clinotty bin/magento setup:config:set --no-interaction  --page-cache=redis --page-cache-redis-server=redis --page-cache-redis-db=1
+
+    echo "Enabling Redis for session..."
+    bin/clinotty bin/magento setup:config:set --no-interaction --session-save=redis --session-save-redis-host=redis --session-save-redis-log-level=4 --session-save-redis-db=2
+
+    echo "Enabling Elasticsearch..."
+    #This is config value for es 6, if you want to use 7 remember to update those values to 7
+    bin/clinotty bin/magento config:set catalog/search/engine elasticsearch6
+    bin/clinotty bin/magento config:set catalog/search/elasticsearch6_server_hostname elasticsearch
+
+    echo "Re-indexing with Elasticsearch..."
+    bin/clinotty bin/magento indexer:reindex
+
+    echo "Clearing the cache to apply updates..."
+    bin/clinotty bin/magento cache:flush
+
+    echo "Copying files from container to host after install..."
+    bin/copyfromcontainer app
+    bin/copyfromcontainer vendor
+
+    echo "Create a DNS host entry for the site..."
+    echo "127.0.0.1 ::1 $BASE_URL" | sudo tee -a /etc/hosts
+
+    echo "Generating SSL certificate..."
+    bin/setup-ssl $BASE_URL
+
+    echo "${green}Docker development environment setup complete.${normal}"
+    echo "You may now access your Magento frontend instance at ${green}https://${BASE_URL}/${normal}"
+    echo "You may now access your Magento admin instance at ${green}https://${BASE_URL}/admin${normal}"
+else
+    echo "All fields above are required to setup, please fill..."
+fi

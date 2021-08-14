@@ -1,0 +1,122 @@
+#!/bin/bash
+TYPE=${1:-ce}
+VERSION=${2:-2.3.5-p1}
+BASE_URL=${3:-magento2.test}
+
+echo "Removing src & creating empty src folder..."
+rm -rf src
+mkdir -p src
+
+echo "Restarting the containers..."
+bin/restart
+sleep 3 #Ensure containers are started...
+
+if hash bin/clinotty composer 2>/dev/null; then
+    PUBLIC_KEY="$(bin/clinotty composer config -gl | grep '\[http-basic.repo.magento.com.username\]' | cut -c40-)"
+    PRIVATE_KEY="$(bin/clinotty composer config -gl | grep '\[http-basic.repo.magento.com.password\]' | cut -c40-)"
+fi
+
+if [ -z "$PUBLIC_KEY" ] || [ -z "$PRIVATE_KEY" ]; then
+    exec < /dev/tty
+    echo
+    echo
+    echo "    Authentication required (repo.magento.com, public_key and private_key):"
+    read -p "        Username: " -e -i "21669500c00158b6a6ef9e36b3683b05" PUBLIC_KEY
+    read -p "        Password: " -e -i "2b5fc6686d6466ddae957f3218e4ddec" PRIVATE_KEY
+    echo
+    if [ -n "$PUBLIC_KEY" ] && [ -n "$PRIVATE_KEY" ]; then
+        read -p "    Add authentication information to host composer config? y/n: " ADD_AUTH
+        echo
+        if [[ $ADD_AUTH =~ ^[Yy]$ ]]; then
+            bin/clinotty composer global config http-basic.repo.magento.com $PUBLIC_KEY $PRIVATE_KEY
+        fi
+        ADD_AUTH=''
+    fi
+    exec <&-
+fi
+
+if [ -n "$PUBLIC_KEY" ] && [ -n "$PRIVATE_KEY" ]; then
+    bin/clinotty composer config http-basic.repo.magento.com $PUBLIC_KEY $PRIVATE_KEY
+    PUBLIC_KEY=''
+    PRIVATE_KEY=''
+fi
+
+echo "Installing magento 2 via composer..."
+bin/clinotty composer global require hirak/prestissimo
+if [ "$TYPE" == "ee" ]
+then
+    echo "Installing EE version..."
+    bin/clinotty composer create-project --repository-url=https://repo.magento.com/ magento/project-enterprise-edition=$VERSION ./
+else
+    echo "Installing CE version..."
+    bin/clinotty composer create-project --repository-url=https://repo.magento.com/ magento/project-community-edition=$VERSION ./
+fi
+
+echo "Running cli installation command...."
+bin/clinotty chmod u+x bin/magento
+bin/clinotty bin/magento setup:uninstall  #Make sure the database is clean
+bin/clinotty bin/magento setup:install \
+  --cleanup-database \
+  --db-host=db \
+  --db-name=magento \
+  --db-user=root \
+  --db-password=magento \
+  --base-url=https://$BASE_URL/ \
+  --backend-frontname=admin \
+  --admin-firstname=Ad \
+  --admin-lastname=Min \
+  --admin-email=admin@sm.local \
+  --admin-user=admin \
+  --admin-password=admin123 \
+  --language=en_US \
+  --currency=USD \
+  --timezone=America/New_York \
+  --amqp-host=rabbitmq \
+  --amqp-port=5672 \
+  --amqp-user=guest \
+  --amqp-password=guest \
+  --amqp-virtualhost=/ \
+  --use-rewrites=1 \
+  --elasticsearch-host=elasticsearch
+
+echo "Turning on developer mode.."
+bin/clinotty bin/magento deploy:mode:set developer
+
+echo "Forcing deploy of static content to speed up initial requests..."
+bin/clinotty bin/magento setup:static-content:deploy -f
+
+echo "Enabling Redis for cache..."
+bin/clinotty bin/magento setup:config:set --no-interaction --cache-backend=redis --cache-backend-redis-server=redis --cache-backend-redis-db=0
+
+echo "Enabling Redis for Full Page Cache..."
+bin/clinotty bin/magento setup:config:set --no-interaction  --page-cache=redis --page-cache-redis-server=redis --page-cache-redis-db=1
+
+echo "Enabling Redis for session..."
+bin/clinotty bin/magento setup:config:set --no-interaction --session-save=redis --session-save-redis-host=redis --session-save-redis-log-level=4 --session-save-redis-db=2
+
+#echo "Enabling Elasticsearch..."
+#This is config value for es 6, if you want to use 7 remember to update those values to 7
+#bin/clinotty bin/magento config:set catalog/search/engine elasticsearch6
+#bin/clinotty bin/magento config:set catalog/search/elasticsearch6_server_hostname elasticsearch
+
+echo "Re-indexing with Elasticsearch..."
+bin/clinotty bin/magento indexer:reindex
+
+echo "Clearing the cache to apply updates..."
+bin/clinotty bin/magento cache:flush
+
+echo "Copying files from container to host after install..."
+bin/copyfromcontainer app
+bin/copyfromcontainer vendor
+
+echo "Generating SSL certificate..."
+bin/setup-ssl $BASE_URL
+
+echo "Create a DNS host entry for the site..."
+echo "127.0.0.1 ::1 $BASE_URL" | sudo tee -a /etc/hosts
+
+echo "Docker development environment setup complete."
+echo "You may now access your Magento frontend instance at https://${BASE_URL}/"
+echo "You may now access your Magento admin instance at https://${BASE_URL}/admin"
+echo "Default admin user/password: admin/admin123"
+
